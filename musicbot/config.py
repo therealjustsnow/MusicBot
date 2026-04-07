@@ -341,6 +341,19 @@ class Config:
             comment=_Dd("MusicBot will automatically delete Now Playing messages."),
         )
 
+        self.nowplaying_keep_until_finished: bool = self.register.init_option(
+            section="ChatResponses",
+            option="NowPlayingKeepUntilFinished",
+            dest="nowplaying_keep_until_finished",
+            default=ConfigDefaults.nowplaying_keep_until_finished,
+            getter="getboolean",
+            comment=_Dd(
+                "When DeleteNowPlaying is enabled, keep the Now Playing message visible\n"
+                "for the full duration of the song instead of deleting it after the short timer.\n"
+                "The message will be removed as soon as the song finishes playing."
+            ),
+        )
+
         self.now_playing_mentions: bool = self.register.init_option(
             section="ChatResponses",
             option="NowPlayingMentions",
@@ -551,15 +564,19 @@ class Config:
                 "Allow MusicBot to save the song queue, so queued songs will survive restarts."
             ),
         )
-        self.pre_download_next_song: bool = self.register.init_option(
+        self.pre_download_next_song: str = self.register.init_option(
             section="Playback",
             option="PreDownloadNextSong",
             dest="pre_download_next_song",
             default=ConfigDefaults.pre_download_next_song,
-            getter="getboolean",
+            getter="getstr",
             comment=_Dd(
-                "Enable MusicBot to download the next song in the queue while a song is playing.\n"
-                "Currently this option does not apply to auto playlist or songs added to an empty queue."
+                "Enable MusicBot to pre-download the next song while one is currently playing.\n"
+                "Accepted values:\n"
+                "  queued      - Pre-download manually queued songs only. (Same as 'yes')\n"
+                "  autoplaylist - Pre-download auto-playlist songs only.\n"
+                "  all         - Pre-download both queued and auto-playlist songs.\n"
+                "  none        - Disable pre-downloading. (Same as 'no')"
             ),
         )
         self.use_experimental_equalization: bool = self.register.init_option(
@@ -922,6 +939,31 @@ class Config:
             ),
         )
 
+        self.ytdlp_ratelimit_leave_vc: bool = self.register.init_option(
+            section="MusicBot",
+            option="YtdlpRatelimitLeaveVC",
+            dest="ytdlp_ratelimit_leave_vc",
+            default=ConfigDefaults.ytdlp_ratelimit_leave_vc,
+            getter="getboolean",
+            comment=_Dd(
+                "If enabled, MusicBot will leave all voice channels when YouTube rate-limits the bot,\n"
+                "then wait for the cooldown period before attempting to resume."
+            ),
+        )
+
+        self.ytdlp_ratelimit_cooldown: float = self.register.init_option(
+            section="MusicBot",
+            option="YtdlpRatelimitCooldown",
+            dest="ytdlp_ratelimit_cooldown",
+            default=ConfigDefaults.ytdlp_ratelimit_cooldown,
+            getter="getduration",
+            comment=_Dd(
+                "How long MusicBot should wait after detecting a YouTube rate-limit before retrying.\n"
+                "You can use a number of seconds or a phrase like:  10 minutes\n"
+                "Only used when YtdlpRatelimitLeaveVC is enabled."
+            ),
+        )
+
         # This is likely to turn into one option for each separate part.
         # Due to how the support for protocols differs from part to part.
         # ytdlp has its own option that uses requests.
@@ -1194,6 +1236,29 @@ class Config:
         :raises: musicbot.exceptions.HelpfulError
             if some validation failed that the user needs to correct.
         """
+        # Normalize PreDownloadNextSong to a known value.
+        # Backward compat: 'yes'/'true' → 'queued',  'no'/'false' → 'none'.
+        _pdns = self.pre_download_next_song.strip().lower()
+        _pdns_map = {
+            "yes": "queued",
+            "true": "queued",
+            "1": "queued",
+            "no": "none",
+            "false": "none",
+            "0": "none",
+        }
+        _valid_pdns = {"queued", "autoplaylist", "all", "none"}
+        if _pdns in _pdns_map:
+            self.pre_download_next_song = _pdns_map[_pdns]
+        elif _pdns in _valid_pdns:
+            self.pre_download_next_song = _pdns
+        else:
+            log.warning(
+                "Unknown value '%s' for PreDownloadNextSong. Defaulting to 'queued'.",
+                self.pre_download_next_song,
+            )
+            self.pre_download_next_song = "queued"
+
         if self.logs_max_kept > MAXIMUM_LOGS_LIMIT:
             log.warning(
                 "Cannot store more than %s log files. Option LogsMaxKept will be limited instead.",
@@ -1525,6 +1590,7 @@ class ConfigDefaults:
     no_nowplaying_auto: bool = False
     nowplaying_channels: Set[int] = set()
     delete_nowplaying: bool = True
+    nowplaying_keep_until_finished: bool = False
     reply_and_mention: bool = True
 
     default_volume: float = 0.15
@@ -1573,6 +1639,8 @@ class ConfigDefaults:
     remove_embed_footer: bool = False
     defaultround_robin_queue: bool = False
     enable_network_checker: bool = False
+    ytdlp_ratelimit_leave_vc: bool = False
+    ytdlp_ratelimit_cooldown: float = 600.0
     enable_local_media: bool = False
     enable_queue_history_global: bool = False
     enable_queue_history_guilds: bool = False
@@ -1583,7 +1651,7 @@ class ConfigDefaults:
     ytdlp_concurrent_frags: int = 1
     downloader_threads_max: int = 2
 
-    pre_download_next_song: bool = True
+    pre_download_next_song: str = "queued"
     default_search_service: str = "ytsearch"
 
     song_blocklist: Set[str] = set()

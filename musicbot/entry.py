@@ -296,7 +296,23 @@ class URLPlaylistEntry(BasePlaylistEntry):
     def title(self) -> str:
         """Gets a title string from entry info or 'Unknown'"""
         # TRANSLATORS: Placeholder for empty track title.
-        return self.info.title or _X("Unknown")
+        base_title = self.info.title or _X("Unknown")
+
+        # For YouTube Music "topic" channels (uploader/channel ends with " - Topic"),
+        # yt-dlp may provide an album field.  Prepend it to show the full context,
+        # e.g. "A Hat in Time (Original Game Soundtrack) - Main Theme".
+        channel = self.info.get("channel", "") or self.info.get("uploader", "") or ""
+        album = self.info.get("album", None)
+        if (
+            isinstance(channel, str)
+            and channel.endswith(" - Topic")
+            and isinstance(album, str)
+            and album
+            and album != base_title
+        ):
+            return f"{album} - {base_title}"
+
+        return base_title
 
     @property
     def duration(self) -> Optional[float]:

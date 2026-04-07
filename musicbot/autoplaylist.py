@@ -1,10 +1,13 @@
 import asyncio
+import hashlib
 import logging
 import pathlib
 import shutil
 import time
 from collections import UserList
 from typing import TYPE_CHECKING, Dict, List, Optional, Set
+
+import aiohttp
 
 from . import write_path
 from .constants import (
@@ -64,6 +67,8 @@ class AutoPlaylist(StrUserList):
     async def load(self, force: bool = False) -> None:
         """
         Loads the playlist file if it has not been loaded.
+        Local file includes are resolved synchronously in _read_playlist().
+        Remote text-URL includes are fetched asynchronously here.
         """
         # ignore loaded lists unless forced.
         if (self._is_loaded or self._file_lock.locked()) and not force:
@@ -72,17 +77,133 @@ class AutoPlaylist(StrUserList):
         # Load the actual playlist file.
         async with self._file_lock:
             try:
-                self.data = self._read_playlist()
+                raw = self._read_playlist()
             except OSError:
                 log.warning("Error loading auto playlist file:  %s", self._file)
                 self.data = []
                 self._is_loaded = False
                 return
+
+            # Expand any remote text-URL entries.
+            expanded: List[str] = []
+            for entry in raw:
+                if self._is_remote_text_url(entry):
+                    remote_urls = await self._fetch_remote_playlist(entry)
+                    log.debug(
+                        "Included %d track(s) from remote URL: %s",
+                        len(remote_urls),
+                        entry,
+                    )
+                    expanded.extend(remote_urls)
+                else:
+                    expanded.append(entry)
+
+            self.data = expanded
             self._is_loaded = True
+
+    def _is_local_file_include(self, line: str) -> bool:
+        """
+        Returns True if the line looks like a local file include
+        (no URL scheme, ends with .txt).
+        """
+        return "://" not in line and line.lower().endswith(".txt")
+
+    def _is_remote_text_url(self, line: str) -> bool:
+        """
+        Returns True if the line looks like a URL pointing to a raw text playlist
+        (e.g. a pastebin raw URL or any https:// URL ending in .txt).
+        """
+        if not (line.startswith("http://") or line.startswith("https://")):
+            return False
+        # Strip query strings and fragments before checking extension.
+        path_part = line.split("?")[0].split("#")[0]
+        return path_part.lower().endswith(".txt") or "/raw/" in line
+
+    def _parse_text_lines(self, text: str) -> List[str]:
+        """Parse raw text into a list of non-comment, non-empty URL lines."""
+        comment_char = "#"
+        result: List[str] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith(comment_char):
+                continue
+            # Only accept lines that look like URLs in included content.
+            if line.startswith("http://") or line.startswith("https://"):
+                result.append(line)
+        return result
+
+    def _read_local_include(self, filepath: pathlib.Path) -> List[str]:
+        """
+        Read a local file include and return its URL entries.
+        Nested includes are not processed (only top-level includes are expanded).
+        """
+        comment_char = "#"
+        result: List[str] = []
+        try:
+            with open(filepath, "r", encoding="utf8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith(comment_char):
+                        continue
+                    # Only include lines that look like URLs.
+                    if line.startswith("http://") or line.startswith("https://"):
+                        result.append(line)
+        except OSError:
+            log.warning("Could not read included playlist file: %s", filepath)
+        return result
+
+    async def _fetch_remote_playlist(self, url: str) -> List[str]:
+        """
+        Fetch a remote text playlist URL and return its URL entries.
+        Caches the downloaded content next to the playlist file so the
+        bot can still play when the remote service is unavailable.
+        """
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+        cache_file = self._file.parent / f"_remote_cache_{url_hash}.txt"
+
+        session: Optional[aiohttp.ClientSession] = getattr(
+            self._bot, "session", None
+        )
+        if session and not session.closed:
+            try:
+                timeout = aiohttp.ClientTimeout(total=30)
+                async with session.get(url, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        text = await resp.text()
+                        urls = self._parse_text_lines(text)
+                        try:
+                            cache_file.write_text(text, encoding="utf8")
+                        except OSError:
+                            log.warning(
+                                "Could not write remote playlist cache: %s", cache_file
+                            )
+                        return urls
+                    log.warning(
+                        "Remote playlist returned HTTP %s: %s", resp.status, url
+                    )
+            except Exception:  # pylint: disable=broad-exception-caught
+                log.warning(
+                    "Failed to fetch remote playlist: %s", url, exc_info=True
+                )
+
+        # Fall back to cached copy if the fetch failed or session is unavailable.
+        if cache_file.is_file():
+            try:
+                text = cache_file.read_text(encoding="utf8")
+                log.info("Using cached remote playlist for: %s", url)
+                return self._parse_text_lines(text)
+            except OSError:
+                pass
+
+        log.warning("No usable data for remote playlist URL: %s", url)
+        return []
 
     def _read_playlist(self) -> List[str]:
         """
         Read and parse the playlist file for track entries.
+        Lines that look like local file paths (no URL scheme, ending in .txt)
+        are expanded inline — all URL lines from the referenced file are included.
+        Remote text-URL entries are handled asynchronously in load().
         """
         # Comments in apl files are only handled based on start-of-line.
         # Inline comments are not supported due to supporting non-URL entries.
@@ -95,7 +216,18 @@ class AutoPlaylist(StrUserList):
                 line = line.strip()
                 if not line or line.startswith(comment_char):
                     continue
-                playlist.append(line)
+                if self._is_local_file_include(line):
+                    # Resolve relative to the autoplaylist directory.
+                    include_path = self._file.parent / line
+                    included = self._read_local_include(include_path)
+                    log.debug(
+                        "Included %d track(s) from local file: %s",
+                        len(included),
+                        include_path,
+                    )
+                    playlist.extend(included)
+                else:
+                    playlist.append(line)
         return playlist
 
     async def clear_all_tracks(self, log_msg: str) -> None:

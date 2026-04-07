@@ -1175,7 +1175,12 @@ class MusicBot(discord.Client):
 
         auto_delete_np: Union[int, float] = 0
         if self.config.delete_nowplaying:
-            auto_delete_np = self.config.delete_delay_short
+            if self.config.nowplaying_keep_until_finished:
+                # Keep the message up for the full song; it will be deleted in
+                # on_player_finished_playing instead of by a timer.
+                auto_delete_np = 0
+            else:
+                auto_delete_np = self.config.delete_delay_short
 
         content = Response("", delete_after=auto_delete_np)
         if entry.thumbnail_url:
@@ -1269,6 +1274,84 @@ class MusicBot(discord.Client):
             self.handle_player_inactivity(player), name="MB_HandleInactivePlayer"
         )
 
+    def _is_ytdlp_ratelimited(self, error: Exception) -> bool:
+        """
+        Heuristic check to determine if the given exception represents
+        a YouTube (or generic) rate-limit / sign-in challenge.
+        """
+        msg = str(error).lower()
+        return (
+            "429" in msg
+            or "too many requests" in msg
+            or "sign in to confirm" in msg
+            or "http error 429" in msg
+        )
+
+    async def _handle_ytdlp_ratelimit(self) -> None:
+        """
+        Called when a rate-limit is detected and YtdlpRatelimitLeaveVC is enabled.
+        Leaves all voice channels, waits for the configured cooldown, then checks
+        whether the rate-limit has lifted.  Logs the outcome so operators know when
+        the bot is available again.
+        """
+        cooldown = self.config.ytdlp_ratelimit_cooldown
+        log.warning(
+            "YouTube rate-limit detected.  Leaving all voice channels and waiting %.0f seconds.",
+            cooldown,
+        )
+
+        # Disconnect from every guild that has an active player.
+        guilds_with_players = list(self.players.keys())
+        for guild_id in guilds_with_players:
+            guild = self.get_guild(guild_id)
+            if guild:
+                await self.disconnect_voice_client(guild)
+
+        await asyncio.sleep(cooldown)
+
+        # Probe with a lightweight extraction to see if we're still rate-limited.
+        probe_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"  # "Me at the zoo"
+        try:
+            await self.downloader.extract_info(probe_url, download=False, process=False)
+            log.info(
+                "YouTube rate-limit appears to have lifted after %.0f s cooldown.  "
+                "Players can be re-summoned manually.",
+                cooldown,
+            )
+        except Exception as probe_exc:  # pylint: disable=broad-exception-caught
+            if self._is_ytdlp_ratelimited(probe_exc):
+                log.warning(
+                    "Still rate-limited after %.0f s.  "
+                    "Consider increasing YtdlpRatelimitCooldown.",
+                    cooldown,
+                )
+            else:
+                log.info(
+                    "Rate-limit probe returned a non-ratelimit error (%s). "
+                    "Assuming rate-limit has lifted.",
+                    probe_exc,
+                )
+
+    async def _pre_download_autoplaylist_url(self, url: str) -> None:
+        """
+        Background task that pre-downloads the audio for the given autoplaylist URL
+        so it is ready when needed.  Used when PreDownloadNextSong includes autoplaylist.
+        """
+        import asyncio as _asyncio
+
+        from .constants import DEFAULT_PRE_DOWNLOAD_DELAY
+
+        await _asyncio.sleep(DEFAULT_PRE_DOWNLOAD_DELAY)
+        try:
+            info = await self.downloader.extract_info(url, download=True, process=True)
+            log.everything(  # type: ignore[attr-defined]
+                "Pre-downloaded autoplaylist track:  %s", url
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            log.debug(
+                "Pre-download of autoplaylist URL failed (will retry later):  %s", url
+            )
+
     async def on_player_finished_playing(self, player: MusicPlayer, **_: Any) -> None:
         """
         Event called by MusicPlayer when playback has finished without error.
@@ -1306,8 +1389,12 @@ class MusicBot(discord.Client):
                 log.info("Player finished and queue is empty, leaving voice channel...")
                 await self.disconnect_voice_client(guild)
 
-        # delete last_np_msg somewhere if we have cached it
-        if self.config.delete_nowplaying:
+        # Delete the now-playing message when the song finishes.
+        # When NowPlayingKeepUntilFinished is enabled the message has no timer,
+        # so we must delete it here.  Otherwise the normal timer path already
+        # handles deletion, but we still clean up the reference in case it
+        # somehow survived (e.g. the timer was long).
+        if self.config.delete_nowplaying or self.config.nowplaying_keep_until_finished:
             guild = player.voice_client.guild
             last_np_msg = self.server_data[guild.id].last_np_msg
             if last_np_msg:
@@ -1433,6 +1520,13 @@ class MusicBot(discord.Client):
                         {"url": song_url, "raw_error": e},
                     )
 
+                    if (
+                        self.config.ytdlp_ratelimit_leave_vc
+                        and self._is_ytdlp_ratelimited(e)
+                    ):
+                        await self._handle_ytdlp_ratelimit()
+                        return
+
                     await self.server_data[guild.id].autoplaylist.remove_track(
                         song_url, ex=e, delete_from_ap=self.config.remove_ap
                     )
@@ -1495,6 +1589,15 @@ class MusicBot(discord.Client):
                     )
                     log.debug("Exception data for above error:", exc_info=True)
                     continue
+
+                # Pre-download the next autoplaylist track if configured.
+                pdns = self.config.pre_download_next_song
+                if pdns in ("autoplaylist", "all") and player.autoplaylist:
+                    next_apl_url = player.autoplaylist[0]
+                    self.create_task(
+                        self._pre_download_autoplaylist_url(next_apl_url),
+                        name="MB_PreDownloadAPLNext",
+                    )
                 break
             # end of autoplaylist loop.
 
@@ -1576,6 +1679,13 @@ class MusicBot(discord.Client):
                 delete_after=self.config.delete_delay_long,
             )
             await self.safe_send_message(entry.channel, res)
+
+        # Check for rate-limit before doing anything else with the player.
+        if self.config.ytdlp_ratelimit_leave_vc and self._is_ytdlp_ratelimited(
+            ex or Exception()
+        ):
+            await self._handle_ytdlp_ratelimit()
+            return
 
         # Take care of auto-playlist related issues.
         if entry and entry.from_auto_playlist:
@@ -6602,46 +6712,60 @@ class MusicBot(discord.Client):
         )
 
     @command_helper(
-        usage=["{cmd} <URL>"],
-        desc=_Dd("Dump the individual URLs of a playlist to a file."),
+        usage=["{cmd} <URL> [URL2 ...]"],
+        desc=_Dd("Dump the individual URLs of one or more playlists to a file."),
     )
     async def cmd_pldump(
         self,
         ssd_: Optional[GuildSpecificData],
         author: discord.Member,
         song_subject: str,
+        leftover_args: List[str],
     ) -> CommandResponse:
         """
-        Extracts all URLs from a playlist and create a file attachment with the resulting links.
+        Extracts all URLs from one or more playlists and creates a file attachment.
         This method does not validate the resulting links are actually playable.
+        Multiple URLs can be passed separated by spaces; all are combined into one file.
         """
+        # Collect all provided URLs.
+        all_subjects = [song_subject] + leftover_args
+        all_song_urls: List[str] = []
+        for subject in all_subjects:
+            url = self.downloader.get_url_or_none(subject)
+            if not url:
+                raise exceptions.CommandError(
+                    "The given URL was not a valid URL: %(subject)s",
+                    fmt_args={"subject": subject},
+                )
+            all_song_urls.append(url)
 
-        song_url = self.downloader.get_url_or_none(song_subject)
-        if not song_url:
-            raise exceptions.CommandError(
-                "The given URL was not a valid URL.",
-            )
+        datafiles: List[discord.File] = []
+        summary_urls: List[str] = []
 
-        try:
-            info = await self.downloader.extract_info(
-                song_url, download=False, process=True
-            )
-        # TODO: i18n stuff with translatable exceptions.
-        except Exception as e:
-            raise exceptions.CommandError(
-                "Could not extract info from input url\n%(raw_error)s\n",
-                fmt_args={"raw_error": e},
-            )
+        for song_url in all_song_urls:
+            try:
+                info = await self.downloader.extract_info(
+                    song_url, download=False, process=True
+                )
+            # TODO: i18n stuff with translatable exceptions.
+            except Exception as e:
+                raise exceptions.CommandError(
+                    "Could not extract info from input url\n%(raw_error)s\n",
+                    fmt_args={"raw_error": e},
+                )
 
-        if not info.get("entries", None):
-            raise exceptions.CommandError("This does not seem to be a playlist.")
+            if not info.get("entries", None):
+                raise exceptions.CommandError(
+                    "This does not seem to be a playlist: %(url)s",
+                    fmt_args={"url": song_url},
+                )
 
-        filename = "playlist.txt"
-        if info.title:
-            safe_title = slugify(info.title)
-            filename = f"playlist_{safe_title}.txt"
+            filename = "playlist.txt"
+            if info.title:
+                safe_title = slugify(info.title)
+                filename = f"playlist_{safe_title}.txt"
 
-        with BytesIO() as fcontent:
+            fcontent = BytesIO()
             total = info.playlist_count or info.entry_count
             fcontent.write(f"# Title:  {info.title}\n".encode("utf8"))
             fcontent.write(f"# Total:  {total}\n".encode("utf8"))
@@ -6654,12 +6778,13 @@ class MusicBot(discord.Client):
                 fcontent.write(line.encode("utf8"))
 
             fcontent.seek(0)
-            msg_str = _D("Here is the playlist dump for:  %(url)s", ssd_) % {
-                "url": song_url
-            }
-            datafile = discord.File(fcontent, filename=filename)
+            datafiles.append(discord.File(fcontent, filename=filename))
+            summary_urls.append(song_url)
 
-            return Response(msg_str, send_to=author, files=[datafile], force_text=True)
+        msg_str = _D("Here is the playlist dump for:  %(urls)s", ssd_) % {
+            "urls": "  ".join(summary_urls)
+        }
+        return Response(msg_str, send_to=author, files=datafiles, force_text=True)
 
     @command_helper(
         usage=["{cmd} [@USER]"],
@@ -8136,6 +8261,10 @@ class MusicBot(discord.Client):
         """
         setcookies command allows management of yt-dlp cookies feature.
         """
+        # Always delete the invoking message immediately for security, regardless of
+        # DeleteInvoking setting — the message may contain or attach sensitive cookie data.
+        await self.safe_delete_message(message)
+
         opt = opt.lower()
         if opt == "on":
             if self.downloader.cookies_enabled:

@@ -466,8 +466,10 @@ class Playlist(EventEmitter, Serializable):
         """
         Enforces a delay before doing pre-download of the "next" song.
         Should only be called from get_next_entry() after pop.
+        Only fires for manually queued (non-auto-playlist) entries.
         """
-        if not self.bot.config.pre_download_next_song:
+        pdns = self.bot.config.pre_download_next_song
+        if pdns not in ("queued", "all"):
             return
 
         if not self.entries:
@@ -475,6 +477,11 @@ class Playlist(EventEmitter, Serializable):
 
         # get the next entry to pre-download before we wait.
         next_entry = self.peek()
+
+        # Only pre-download non-autoplaylist entries here; autoplaylist
+        # pre-download is handled separately in _guild_queue_autofill.
+        if next_entry and getattr(next_entry, "from_auto_playlist", False):
+            return
 
         await asyncio.sleep(DEFAULT_PRE_DOWNLOAD_DELAY)
 
