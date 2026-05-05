@@ -28,6 +28,7 @@ import yt_dlp as youtube_dl  # type: ignore[import-untyped]
 from . import downloader, exceptions, write_path
 from .aliases import Aliases, AliasesDefault
 from .autoplaylist import AutoPlaylistManager
+from .custom_extractors import CustomExtractorManager
 from .config import Config, ConfigDefaults
 from .constants import (
     DATA_FILE_SERVERS,
@@ -219,6 +220,7 @@ class MusicBot(commands.Bot):
             self.aliases = Aliases(aliases_file, nat_cmds)
 
         self.playlist_mgr = AutoPlaylistManager(self)
+        self.custom_extractors = CustomExtractorManager(self)
 
         self.aiolocks: DefaultDict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self.filecache = AudioFileCache(self)
@@ -285,6 +287,9 @@ class MusicBot(commands.Bot):
         """async init phase that is called by d.py before login."""
         if self.config.enable_queue_history_global:
             await self.playlist_mgr.global_history.load()
+
+        if self.config.enable_custom_extractors:
+            self.custom_extractors.load_extractors()
 
         # TODO: testing is needed to see if this would be required.
         # See also:  https://github.com/aio-libs/aiohttp/discussions/6044
@@ -3056,6 +3061,36 @@ class MusicBot(commands.Bot):
         return Response(
             _D("\N{OK HAND SIGN}", ssd_),
             force_text=True,
+        )
+
+    @owner_only
+    @command_helper(
+        desc=_Dd(
+            "Reload all custom extractor definitions from the extractors directory.\n"
+            "Also clears the in-memory response cache for custom extractors.\n"
+            "Throws an error if custom extractors are disabled in options."
+        )
+    )
+    async def cmd_reloadcustomextractors(
+        self,
+        ssd_: Optional[GuildSpecificData],
+    ) -> CommandResponse:
+        """
+        Hot-reload custom extractor .properties files.
+        """
+        if not self.config.enable_custom_extractors:
+            raise exceptions.CommandError(
+                "Custom extractors are disabled. "
+                "Enable EnableCustomExtractors in options.ini first."
+            )
+
+        count = self.custom_extractors.load_extractors()
+        return Response(
+            _D(
+                "Reloaded %(count)s custom extractor(s). Response cache cleared.",
+                ssd_,
+            )
+            % {"count": count}
         )
 
     @command_helper(
