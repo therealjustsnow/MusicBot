@@ -67,6 +67,7 @@ DEFAULT_PLAYLIST_DIR: str = "config/playlists/"
 DEFAULT_MEDIA_FILE_DIR: str = "media/"
 DEFAULT_AUDIO_CACHE_DIR: str = "audio_cache/"
 DEFAULT_DATA_DIR: str = "data/"
+DEFAULT_EXTRACTORS_DIR: str = "config/extractors/"
 
 # File names within the DEFAULT_DATA_DIR or guild folders.
 DATA_FILE_SERVERS: str = "server_names.txt"

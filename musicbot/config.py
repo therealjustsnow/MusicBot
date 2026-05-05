@@ -30,6 +30,7 @@ from .constants import (
     DEFAULT_AUDIO_CACHE_DIR,
     DEFAULT_COMMAND_ALIAS_FILE,
     DEFAULT_DATA_DIR,
+    DEFAULT_EXTRACTORS_DIR,
     DEFAULT_FOOTER_TEXT,
     DEFAULT_LOG_LEVEL,
     DEFAULT_LOGS_KEPT,
@@ -614,6 +615,20 @@ class Config:
             ),
         )
 
+        self.enable_custom_extractors: bool = self.register.init_option(
+            section="MusicBot",
+            option="EnableCustomExtractors",
+            dest="enable_custom_extractors",
+            default=ConfigDefaults.enable_custom_extractors,
+            getter="getboolean",
+            comment=_Dd(
+                "Enable loading custom extractor scripts from the CustomExtractorsPath directory.\n"
+                "Custom extractors allow the bot to play from websites not supported by yt-dlp.\n"
+                "WARNING: Custom extractors execute arbitrary code on your system.\n"
+                "Only load extractors from sources you fully trust."
+            ),
+        )
+
         self.auto_unpause_on_play: bool = self.register.init_option(
             section="Playback",
             option="UnpausePlayerOnPlay",
@@ -1133,6 +1148,19 @@ class Config:
             default_is_empty=True,
         )
 
+        self.custom_extractors_path: pathlib.Path = self.register.init_option(
+            section="Files",
+            option="CustomExtractorsPath",
+            dest="custom_extractors_path",
+            default=ConfigDefaults.custom_extractors_path,
+            getter="getpathlike",
+            comment=_Dd(
+                "Directory where custom extractor .properties files are stored.\n"
+                "Only used when EnableCustomExtractors is enabled."
+            ),
+            default_is_empty=True,
+        )
+
         self.logs_max_kept: int = self.register.init_option(
             section="Files",
             option="LogsMaxKept",
@@ -1642,6 +1670,7 @@ class ConfigDefaults:
     ytdlp_ratelimit_leave_vc: bool = False
     ytdlp_ratelimit_cooldown: float = 600.0
     enable_local_media: bool = False
+    enable_custom_extractors: bool = False
     enable_queue_history_global: bool = False
     enable_queue_history_guilds: bool = False
     auto_unpause_on_play: bool = False
@@ -1670,6 +1699,7 @@ class ConfigDefaults:
     auto_playlist_dir: pathlib.Path = write_path(DEFAULT_PLAYLIST_DIR)
     media_file_dir: pathlib.Path = write_path(DEFAULT_MEDIA_FILE_DIR)
     audio_cache_path: pathlib.Path = write_path(DEFAULT_AUDIO_CACHE_DIR)
+    custom_extractors_path: pathlib.Path = write_path(DEFAULT_EXTRACTORS_DIR)
 
     @staticmethod
     def _debug_level() -> Tuple[str, int]:

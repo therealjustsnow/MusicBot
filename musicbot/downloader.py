@@ -394,6 +394,9 @@ class Downloader:
         :raises: yt_dlp.networking.exceptions.RequestError
             as a base exception for any networking errors raised by yt_dlp.
         """
+        # pop internal-only flag before any kwargs are forwarded to yt-dlp.
+        skip_custom = kwargs.pop("_skip_custom_extractors", False)
+
         # handle local media playback without ever touching ytdl and friends.
         # We do this here so auto playlist features can take advantage of this as well.
         if self.bot.config.enable_local_media and song_subject.lower().startswith(
@@ -404,6 +407,14 @@ class Downloader:
         if song_subject.lower().startswith("mbapl://"):
             log.debug("AutoPlaylist requested:  %s", song_subject)
             return await self._return_autoplaylist(song_subject)
+
+        # Check custom extractors before yt-dlp so they can override default behaviour.
+        if not skip_custom and self.bot.config.enable_custom_extractors:
+            custom_result = await self._try_custom_extractor(
+                song_subject, *args, **kwargs
+            )
+            if custom_result is not None:
+                return custom_result
 
         # Hash the URL for use as a unique ID in file paths.
         # but ignore services with multiple URLs for the same media.
@@ -615,6 +626,124 @@ class Downloader:
             self.thread_pool,
             functools.partial(self.safe_ytdl.extract_info, *args, **kwargs),
         )
+
+    async def _try_custom_extractor(
+        self, song_subject: str, *args: Any, **kwargs: Any
+    ) -> Optional["YtdlpResponseDict"]:
+        """
+        Check whether any custom extractor matches `song_subject` and, if so,
+        run it and return a YtdlpResponseDict.
+
+        Returns None when no extractor matches or when the script returns an
+        empty response (signalling fallback to default yt-dlp logic).
+
+        Raises ExtractionError on script or parse failures so that the bot can
+        surface a useful message and trigger autoplaylist-remove if needed.
+        """
+        mgr = self.bot.custom_extractors
+        extractor = mgr.match_url(song_subject)
+        if extractor is None:
+            return None
+
+        log.debug(
+            "Custom extractor '%s' matched URL: %s", extractor.name, song_subject
+        )
+
+        try:
+            response = await mgr.run_extractor(extractor, song_subject)
+        except ValueError as e:
+            raise ExtractionError(
+                "Custom extractor '%(name)s' failed: %(error)s",
+                fmt_args={"name": extractor.name, "error": str(e)},
+            ) from e
+
+        if not response:
+            log.debug(
+                "Custom extractor '%s' returned empty response for: %s",
+                extractor.name,
+                song_subject,
+            )
+            return None
+
+        download = kwargs.get("download", True)
+
+        if "track" in response:
+            return await self._custom_extractor_track(
+                extractor, song_subject, response["track"], download, *args, **kwargs
+            )
+
+        if "album" in response:
+            data = mgr.build_album_data(extractor, song_subject, response["album"])
+            return YtdlpResponseDict(data)
+
+        return None
+
+    async def _custom_extractor_track(
+        self,
+        extractor: Any,
+        input_url: str,
+        track_data: Dict[str, Any],
+        download: bool,
+        *args: Any,
+        **kwargs: Any,
+    ) -> "YtdlpResponseDict":
+        """
+        Build a YtdlpResponseDict for a single track returned by a custom
+        extractor.  When `download` is True the result URL is also downloaded
+        via yt-dlp so the entry has a local file path.
+        """
+        mgr = self.bot.custom_extractors
+        result_url: str = track_data["result"]
+        name: str = track_data.get("name", "") or ""
+        thumbnail: str = track_data.get("thumbnail", "") or ""
+
+        if result_url.startswith("audio-cache://"):
+            data = mgr.build_audio_cache_track_data(extractor, input_url, track_data)
+            return YtdlpResponseDict(data)
+
+        # Direct audio URL — use yt-dlp to obtain (and optionally download) the
+        # result URL, then overlay our metadata on top.
+        md5 = hashlib.md5()  # nosec
+        md5.update(result_url.encode("utf8"))
+        qhash = md5.hexdigest()[-8:]
+
+        # Strip kwargs that are not for yt-dlp (already consumed above).
+        ytdlp_kwargs = {k: v for k, v in kwargs.items() if k not in ("as_stream",)}
+        if "download" in ytdlp_kwargs:
+            ytdlp_kwargs["download"] = download
+
+        try:
+            dl_data = await self._filtered_extract_info(
+                result_url,
+                *args,
+                extra_info={"qhash": qhash},
+                **ytdlp_kwargs,
+            )
+        except Exception as e:
+            raise ExtractionError(
+                "Custom extractor '%(name)s' result URL could not be processed: %(error)s",
+                fmt_args={"name": extractor.name, "error": str(e)},
+            ) from e
+
+        # Compute the expected filename before we change the title so the stem
+        # matches what yt-dlp actually wrote on disk.
+        expected_filename = self.ytdl.prepare_filename(dl_data)
+
+        # Overlay our metadata.
+        if name:
+            dl_data["title"] = name
+        if thumbnail:
+            dl_data["thumbnail"] = thumbnail
+        dl_data["webpage_url"] = input_url
+        dl_data["__input_subject"] = input_url
+        dl_data["extractor"] = extractor.extractor_name
+        dl_data["_type"] = "video"
+        dl_data["__expected_filename"] = expected_filename
+
+        headers = await self.get_url_headers(result_url)
+        dl_data["__header_data"] = headers or None
+
+        return YtdlpResponseDict(dl_data)
 
     def _return_local_media(self, song_subject: str) -> "YtdlpResponseDict":
         """Verifies local media files and returns suitable data for local entries."""
