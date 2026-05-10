@@ -3,7 +3,10 @@ Custom extractor support for MusicBot.
 
 Users can drop .properties files into config/extractors/ to define external
 scripts that MusicBot will call when a URL matches the extractor's regex.
-The working directory when running a script is the extractors folder itself.
+The working directory when running a script is a subdirectory of the
+extractors folder named after the extractor stem, e.g.
+config/extractors/my-extractor/.  The directory is created automatically
+if it does not already exist.
 
 Extractor definition format (config/extractors/my-extractor.properties):
 
@@ -202,7 +205,9 @@ class CustomExtractorManager:
             "{audio_cache}", audio_cache
         )
 
-        working_dir = str(extractor.source_file.parent.resolve())
+        working_dir = extractor.source_file.parent / extractor.name
+        working_dir.mkdir(parents=True, exist_ok=True)
+        working_dir = str(working_dir.resolve())
 
         try:
             if platform.system() == "Windows":
