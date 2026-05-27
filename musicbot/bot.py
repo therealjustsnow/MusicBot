@@ -851,6 +851,7 @@ class MusicBot(discord.Client):
 
         if guild.id in self.players:
             log.info("Disconnecting a MusicPlayer in guild:  %s", guild)
+            await self.serialize_queue(guild)
             player = self.players.pop(guild.id)
 
             await self.reset_player_inactivity(player)
